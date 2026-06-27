@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Session artifacts — contain session tokens + cookies. NEVER commit.
+session.json
+session
+*.env.*
+!.env.example
+CLAUDE.md
