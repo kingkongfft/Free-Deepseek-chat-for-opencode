@@ -9,3 +9,15 @@ session
 *.env.*
 !.env.example
 CLAUDE.md
+
+# Runtime logs
+*.log
+*.err
+nul
+debug_continuation.txt
+
+# Service logs (written by NSSM)
+logs/
+
+# Downloaded NSSM binary
+tools/nssm/

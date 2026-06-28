@@ -212,6 +212,65 @@ Review the results and either:
 
 ---
 
+## Auto-start on Windows boot (Task Scheduler)
+
+Registered via Task Scheduler — no admin rights required. Starts at logon with a 10 s delay (gives network time to come up).
+
+### Files
+| File | Purpose |
+|---|---|
+| `startup.ps1` | Wrapper: kills old process on port, starts app.py hidden, writes PID to log |
+| `register-startup.ps1` | Register the Task Scheduler task + immediate test run |
+| `unregister-startup.ps1` | Stop the process and remove the task |
+| `logs\startup.log` | Timestamp + PID written each time the task fires |
+| `logs\app.log` | Uvicorn stdout (requests, INFO messages) |
+| `logs\app-error.log` | Stderr / crash output |
+
+### Install
+```powershell
+# Sign in first (only needed once)
+python -m deepseek.auth
+
+# Register task — also starts immediately and runs a health check
+.\register-startup.ps1
+```
+
+### How it works
+1. Task Scheduler fires `startup.ps1` at logon (+ 10 s delay)
+2. `startup.ps1` kills any existing Python process on port 8000
+3. Starts `venv\Scripts\python.exe app.py` with `-WindowStyle Hidden`
+4. Logs PID to `logs\startup.log`; uvicorn output goes to `logs\app.log`
+
+### Manage
+```powershell
+# Check status
+Get-ScheduledTask -TaskName DeepSeekAPI | Select-Object TaskName, State
+
+# Start manually
+Start-ScheduledTask -TaskName DeepSeekAPI
+
+# Stop
+Stop-Process -Name python -ErrorAction SilentlyContinue
+
+# Restart
+Stop-Process -Name python -ErrorAction SilentlyContinue; Start-Sleep 1; Start-ScheduledTask -TaskName DeepSeekAPI
+```
+
+### Session expiry
+DeepSeek sessions last ~6 hours. When expired:
+```powershell
+python -m deepseek.auth
+Stop-Process -Name python -ErrorAction SilentlyContinue
+Start-ScheduledTask -TaskName DeepSeekAPI
+```
+
+### Remove
+```powershell
+.\unregister-startup.ps1
+```
+
+---
+
 ## Known Limitations
 - Requires clear, specific prompts — vague prompts may not trigger tools
 - `deepseek-chat` more reliable than `deepseek-expert` for tool calling; expert model tends to output fenced JSON
@@ -219,6 +278,7 @@ Review the results and either:
 - No retry mechanism when model emits pure prose with no detectable tool call format
 - Session pinning reuses one chat thread — very long sessions may hit DeepSeek context limits
 - opencode does not echo `conversation_id` back — every turn is a stateless fresh call
+- Auto-start task requires manual session refresh every ~6 hours (`python -m deepseek.auth` + `Start-ScheduledTask -TaskName DeepSeekAPI`)
 
 ---
 

@@ -23,7 +23,7 @@ python app.py             # http://127.0.0.1:8000
 ## Critical quirks
 1. **Session is browser-based** — Chrome opens for first login. Session cached in `session/` (gitignored). Auto-refreshes for ~6 hours.
 2. **PoW is serialized** — wasmtime Store is not reentrant. All requests queue behind a lock (`_pow_lock`). Don't hammer it.
-3. **Tool calling uses prompt injection** — tools injected into prompt, model outputs `<tool_call>` blocks. Parser handles 5 output variants (see `TOOL_CALLING_IMPROVEMENTS.md`). Two common failure modes: (a) model outputs fenced JSON `` ```json `` instead of `<tool_call>`, (b) model narrates "I'll do X" with no XML at all — unrecoverable without retry.
+3. **Tool calling uses prompt injection** — tools injected into prompt, model outputs `<tool_call>` blocks. Parser handles 7 output variants (see `TOOL_CALLING_IMPROVEMENTS.md`). Two common failure modes: (a) model outputs fenced JSON `` ```json `` instead of `<tool_call>`, (b) model narrates "I'll do X" with no XML at all — unrecoverable without retry.
 4. **`deepseek-chat` >> `deepseek-expert` for tool calling** — Expert narrates or outputs fenced JSON much more often, especially on continuation turns. Only use expert for pure reasoning, never for agentic multi-step tasks.
 5. **Continuation turns are unreliable** — when a tool result is returned, the model often says "Done" instead of calling the next tool. Workaround: chain multi-step operations into one `&&` bash command to avoid continuation turns entirely.
 6. **Rate limit** — 30 req/min per IP by default (`RATE_LIMIT_PER_MINUTE`). Over-limit gets 429 with `Retry-After`.

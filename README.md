@@ -24,7 +24,10 @@ The original [sums001/Deepseek-API](https://github.com/sums001/Deepseek-API) pro
 
 ## opencode quick start
 
-**1. Start the server**
+> **Use `deepseek-chat` for all agentic/tool-calling tasks in opencode.**  
+> `deepseek-expert` is unreliable for tool calling — it narrates instead of emitting tool call blocks.
+
+**1. Clone and start the server**
 
 ```powershell
 git clone https://github.com/kingkongfft/Deepseek-API
@@ -36,7 +39,13 @@ python -m deepseek.auth        # sign in once — browser opens
 python app.py                  # server at http://127.0.0.1:8000
 ```
 
-**2. Configure opencode** — add to your `opencode.json`:
+Verify it's running:
+```powershell
+curl http://127.0.0.1:8000/healthz
+# -> {"status":"ok"}
+```
+
+**2. Add the provider to opencode** — edit `~/.config/opencode/opencode.json` (or run `opencode` once to create it):
 
 ```json
 {
@@ -63,13 +72,21 @@ python app.py                  # server at http://127.0.0.1:8000
 }
 ```
 
-**3. (Optional) Pin to a single chat session** so all turns appear in one DeepSeek UI thread:
+**3. Select the model in opencode**
+
+Launch opencode, press `Ctrl+P` → **Model** → choose **DeepSeek Chat (Local)**.  
+Use `deepseek-chat` for all coding tasks — it has reliable tool calling.  
+Use `deepseek-expert` only for one-shot reasoning questions (no tool use).
+
+**4. (Optional) Pin to a single chat session** so all turns appear in one DeepSeek UI thread:
 
 ```powershell
 # Copy the UUID from: https://chat.deepseek.com/a/chat/s/<UUID>
 $env:DEEPSEEK_SESSION_ID="your-session-uuid-here"
 python app.py
 ```
+
+**Tool calling works out of the box** — all 9 opencode built-in tools (`bash`, `read`, `write`, `edit`, `glob`, `grep`, `webfetch`, `todowrite`, `task`) are supported. The server injects tool definitions into the prompt and parses the model's output across 7 output formats automatically.
 
 ---
 
@@ -83,6 +100,9 @@ Tool definitions sent in the `tools` field are injected into the prompt. The mod
 | Named attribute | `<tool_call name="bash">{"command": "ls"}</tool_call>` |
 | Anthropic XML | `<tool_calls><invoke name="bash"><parameter name="command">ls</parameter></invoke></tool_calls>` |
 | Direct tag | `<bash>{"command": "ls"}</bash>` |
+| Fenced JSON | ` ```json\n{"name":"bash","arguments":{...}}\n``` ` |
+| Fenced shell | ` ```bash\nls -la\n``` ` (wrapped as `bash` tool call) |
+| Split hyphenated | `<function-name>bash</function-name><function-params>{"command":"ls"}</function-params>` |
 
 Multiple parallel tool calls in one response (Anthropic XML format) are fully supported.
 
@@ -101,6 +121,53 @@ Multiple parallel tool calls in one response (Anthropic XML format) are fully su
 | `task` | `description`, `prompt`, `subagent_type` | `task_id` |
 
 See [TOOL_CALLING_IMPROVEMENTS.md](TOOL_CALLING_IMPROVEMENTS.md) for full technical detail.
+
+---
+
+## Auto-start on Windows boot (Task Scheduler)
+
+Use the included scripts to register a Task Scheduler task that starts the app automatically at logon — no admin rights required.
+
+> **Prerequisite:** Run `python -m deepseek.auth` first to create the browser session.
+
+**Register (runs immediately + on every future logon):**
+
+```powershell
+.\register-startup.ps1
+```
+
+Output:
+```
+Task 'DeepSeekAPI' registered.
+  Runs at:   logon of YourUser (+ 10 s delay)
+  Script:    ...\startup.ps1
+  Logs:      ...\logs\app.log
+
+Task state: Running
+Health check: {"status":"ok"}
+```
+
+**Logs:**
+
+| File | Contents |
+|---|---|
+| `logs\startup.log` | Start timestamp and PID each boot |
+| `logs\app.log` | Uvicorn stdout (requests, INFO) |
+| `logs\app-error.log` | Stderr / crash output |
+
+**Remove:**
+
+```powershell
+.\unregister-startup.ps1
+```
+
+**Session expiry:** DeepSeek sessions last ~6 hours. When expired, refresh and restart:
+
+```powershell
+python -m deepseek.auth
+Stop-Process -Name python -ErrorAction SilentlyContinue
+Start-ScheduledTask -TaskName DeepSeekAPI
+```
 
 ---
 
