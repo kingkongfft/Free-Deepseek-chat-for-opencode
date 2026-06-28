@@ -186,6 +186,7 @@ MANDATORY RULES:
 - Do NOT write any text before or after the <tool_call> block.
 - Do NOT say "I'll ...", "Let me ...", or narrate your action.
 - Do NOT add attributes to the tag: WRONG: <tool_call name="read"> — CORRECT: <tool_call>
+- Do NOT add an arguments= attribute: WRONG: <tool_call name="bash" arguments={{...}}> — CORRECT: put JSON in the tag body.
 - Do NOT use <write>...</write> or any XML tag other than <tool_call>.
 - The JSON inside <tool_call> MUST have "name" and "arguments" keys.
 - If no tool is needed, respond normally in plain text.
@@ -238,6 +239,21 @@ def _parse_invoke_block(invoke_text: str) -> Optional[Tuple[str, Dict[str, Any]]
     return fn_name, args
 
 
+def _parse_parameter_payload(raw: str) -> Optional[Dict[str, Any]]:
+    params = re.findall(
+        r'<parameter\s+name=["\']([^"\']+)["\'][^>]*>\s*(.*?)\s*</parameter>',
+        raw,
+        re.DOTALL,
+    )
+    if not params:
+        return None
+    args: Dict[str, Any] = {}
+    for k, v in params:
+        obj = _parse_json_block(v)
+        args[k] = obj if obj is not None else v.strip()
+    return args
+
+
 def _parse_tool_calls(
     text: str,
     tools: Optional[List[Tool]] = None,
@@ -250,6 +266,7 @@ def _parse_tool_calls(
     Handles all observed DeepSeek output formats:
     1. Standard:      <tool_call>{"name": "fn", "arguments": {...}}</tool_call>
     2. Named attr:    <tool_call name="fn">{"arg": "val"}</tool_call>
+    2b. Attr-based:   <tool_call name="fn" arguments={"arg": "val"}}  (self-closing, no body)
     3. Anthropic XML: <tool_calls><invoke name="fn"><parameter name="k">v</parameter></invoke></tool_calls>
     4. Direct tag:    <fn_name>{"arg": "val"}</fn_name>
     5. Code-fenced JSON inside any of the above
@@ -326,6 +343,10 @@ def _parse_tool_calls(
                 if obj is not None:
                     tool_calls.append(_make_tool_call(fn_name, obj))
                 else:
+                    param_obj = _parse_parameter_payload(raw)
+                    if param_obj is not None:
+                        tool_calls.append(_make_tool_call(fn_name, param_obj))
+                        continue
                     tool_calls.append(
                         _make_tool_call(fn_name, {"content": raw.strip()})
                     )
@@ -334,6 +355,40 @@ def _parse_tool_calls(
     # Strip any stray/orphaned XML tags left over
     cleaned = re.sub(r"</tool_call>", "", cleaned).strip()
     cleaned = re.sub(r"<tool_calls?>", "", cleaned).strip()
+
+    # --- Format 2b: <tool_call name="fn" arguments={...}> (self-closing / attr-based) ---
+    # Model emits the entire call as attributes on the opening tag, no closing tag.
+    # e.g. <tool_call name="bash" arguments={"command": "ls"}}
+    if not tool_calls:
+        attr_pattern = (
+            r'<tool_call\s+name=["\']([^"\']+)["\'][^>]*\barguments=(\{.*?\})\}?'
+        )
+        attr_matches = re.findall(attr_pattern, text, re.DOTALL)
+        if attr_matches:
+            for fn_name, raw_args in attr_matches:
+                # raw_args may have an extra trailing } from the attribute syntax
+                obj = _parse_json_block(raw_args)
+                if obj is not None:
+                    tool_calls.append(_make_tool_call(fn_name, obj))
+                else:
+                    tool_calls.append(
+                        _make_tool_call(fn_name, {"content": raw_args.strip()})
+                    )
+            cleaned = re.sub(attr_pattern, "", cleaned, flags=re.DOTALL).strip()
+        # Also handle self-closing with no body: <tool_call name="fn" arguments={...}/>
+        if not tool_calls:
+            sc_pattern = r'<tool_call\s+name=["\']([^"\']+)["\'][^>]*\barguments=(\{[^>]*?\})\s*/>'
+            sc_matches = re.findall(sc_pattern, text, re.DOTALL)
+            if sc_matches:
+                for fn_name, raw_args in sc_matches:
+                    obj = _parse_json_block(raw_args)
+                    if obj is not None:
+                        tool_calls.append(_make_tool_call(fn_name, obj))
+                    else:
+                        tool_calls.append(
+                            _make_tool_call(fn_name, {"content": raw_args.strip()})
+                        )
+                cleaned = re.sub(sc_pattern, "", cleaned, flags=re.DOTALL).strip()
 
     # --- Format 4: <tool_name>...</tool_name> using actual tool names ---
     # Only attempted when all above found nothing, and we know the tool names.
@@ -347,6 +402,10 @@ def _parse_tool_calls(
                 if obj is not None:
                     tool_calls.append(_make_tool_call(name, obj))
                 else:
+                    param_obj = _parse_parameter_payload(raw)
+                    if param_obj is not None:
+                        tool_calls.append(_make_tool_call(name, param_obj))
+                        continue
                     tool_calls.append(_make_tool_call(name, {"content": raw.strip()}))
             if tag_matches:
                 cleaned = re.sub(tag_pattern, "", cleaned, flags=re.DOTALL).strip()
@@ -376,7 +435,11 @@ def _parse_tool_calls(
             fn_name = fn_name_m.group(1).strip()
             raw_params = fn_params_m.group(1).strip() if fn_params_m else "{}"
             obj = _parse_json_block(raw_params)
-            args = obj if obj is not None else {"content": raw_params}
+            if obj is not None:
+                args = obj
+            else:
+                param_obj = _parse_parameter_payload(raw_params)
+                args = param_obj if param_obj is not None else {"content": raw_params}
             tool_calls.append(_make_tool_call(fn_name, args))
             cleaned = re.sub(fn_name_pattern, "", cleaned, flags=re.DOTALL)
             cleaned = re.sub(fn_params_pattern, "", cleaned, flags=re.DOTALL).strip()
@@ -515,6 +578,23 @@ def _looks_like_file_display_command(command: str) -> bool:
     return bool(re.fullmatch(r"(?:get-content|cat|type)\s+.*", cmd))
 
 
+def _is_display_request(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    display_markers = (
+        "print the content",
+        "print the file",
+        "print the readme",
+        "show the content",
+        "show the file",
+        "show me the content",
+        "read the file",
+        "display the content",
+    )
+    return any(marker in lowered for marker in display_markers)
+
+
 def _command_arg_from_tool_call(arguments: str) -> Optional[str]:
     try:
         parsed = json.loads(arguments or "{}")
@@ -631,12 +711,12 @@ def messages_to_prompt(
                 loop_count = len(recent_calls)
 
         if loop_name is None and len(recent_calls) >= 2:
-            # (b) Same tool name repeated 2+ times regardless of args
+            # (b) Same high-risk tool name repeated 2+ times regardless of args
             from collections import Counter
 
             name_counts = Counter(n for n, _ in recent_calls)
             most_common_name, most_common_count = name_counts.most_common(1)[0]
-            if most_common_count >= 2:
+            if most_common_name in {"bash", "write", "edit"} and most_common_count >= 5:
                 loop_name = most_common_name
                 loop_count = most_common_count
 
@@ -734,8 +814,12 @@ def messages_to_prompt(
                     break
             read_query_tools = {"read", "grep", "glob", "webfetch"}
             last_was_read = last_tool_call_name in read_query_tools
+            last_user_text = _text_of(last_user.content) if last_user else ""
+            should_display_result = last_was_read and _is_display_request(
+                last_user_text
+            )
 
-            if last_was_read:
+            if should_display_result:
                 next_step_instruction = (
                     f"The tool result above contains the requested content. "
                     f"Output it directly as plain text — do NOT call any more tools."

@@ -120,6 +120,15 @@ Body is the arguments dict directly (no `name`/`arguments` wrapper).
 ```
 Supports **multiple parallel tool calls** in one response. The outer `<tool_call>` wrapper is stripped before parsing `<tool_calls>`.
 
+### Format 2b — Attribute-based self-closing (new)
+```
+<tool_call name="bash" arguments={"command": "ls -la"}}
+```
+Model emits the entire call as XML attributes on the opening tag — no body, no closing tag.
+The `arguments=` value is parsed as JSON directly from the attribute text.
+Also handles an explicit self-closing form: `<tool_call name="bash" arguments={...}/>`.
+**Prompt rule added:** `Do NOT add an arguments= attribute` to suppress this output pattern.
+
 ### Format 4 — Direct tool-name tag (last resort)
 ```
 <write>{"filePath": "/path/to/file", "content": "..."}</write>
@@ -166,6 +175,7 @@ Orphaned `</tool_call>`, `<tool_call>`, `<tool_calls>` tags left over after extr
 - Do NOT write any text before or after the <tool_call> block.
 - Do NOT say "I'll ...", "Let me ...", or narrate your action.
 - Do NOT add attributes to the tag: WRONG: <tool_call name="read"> — CORRECT: <tool_call>
+- Do NOT add an arguments= attribute: WRONG: <tool_call name="bash" arguments={{...}}> — CORRECT: put JSON in the tag body.
 - Do NOT use <write>...</write> or any XML tag other than <tool_call>.
 - The JSON inside <tool_call> MUST have "name" and "arguments" keys.
 - If no tool is needed, respond normally in plain text.
@@ -285,9 +295,13 @@ Start-ScheduledTask -TaskName DeepSeekAPI
 .\unregister-startup.ps1
 ```
 
----
+### 7. Attribute-based `<tool_call name=X arguments={...}>` leaks as raw text
+**Symptom:** Raw `<tool_call name="bash" arguments={"command": "..."}}` text appears in the UI response instead of being executed.  
+**Root cause (a):** Loop detection (`most_common_count >= 2` for `bash`/`write`/`edit`) fired after just two consecutive `bash` calls, disabled tool injection, causing the model to emit an ad-hoc attribute format the parser didn't recognise.  
+**Root cause (b):** None of the 7 existing parsers matched the attribute-based format.  
+**Fix:** Loop threshold raised from `>= 2` to `>= 5` for `bash`/`write`/`edit`; new **Format 2b** parser added for `<tool_call name="fn" arguments={...}>`.
 
-## Known Limitations
+---
 - Requires clear, specific prompts — vague prompts may not trigger tools
 - `deepseek-chat` more reliable than `deepseek-expert` for tool calling; expert model tends to output fenced JSON
 - Tool definitions injected via prompt injection (not native API support)
