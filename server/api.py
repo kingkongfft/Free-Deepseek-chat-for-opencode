@@ -21,6 +21,7 @@ RATE_LIMIT_PER_MINUTE); /healthz is exempt.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -33,13 +34,19 @@ from deepseek.auth import LoginRequired
 from deepseek.client import DeepSeekClient
 
 from .config import (
+    DEEPSEEK_SESSION_ID,
     MODEL_MAP,
     RATE_LIMIT_PER_MINUTE,
     SERVER_INTERACTIVE_LOGIN,
     is_known_model,
     resolve_model_type,
 )
-from .openai_format import completion_response, messages_to_prompt, stream_chunks
+from .openai_format import (
+    completion_response,
+    messages_to_prompt,
+    stream_chunks,
+    _parse_tool_calls,
+)
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest
 
@@ -47,6 +54,8 @@ load_dotenv()
 
 app = FastAPI(title="DeepSeek OpenAI-compatible API", version="0.1.0")
 install_rate_limit(app, RateLimiter(limit=RATE_LIMIT_PER_MINUTE, window=60.0))
+
+_log = logging.getLogger(__name__)
 
 # One shared client (and its signed-in session) built lazily on first use.
 _client: DeepSeekClient | None = None
@@ -100,19 +109,35 @@ def list_models():
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     if not req.messages:
-        return _error("`messages` must not be empty", status=400, err_type="invalid_request_error")
+        return _error(
+            "`messages` must not be empty", status=400, err_type="invalid_request_error"
+        )
+
+    # Debug: log incoming tool names so we can verify opencode's tool definitions
+    if req.tools:
+        tool_names = [t.function.name for t in req.tools]
+        _log.debug("Incoming tools: %s", tool_names)
 
     if not is_known_model(req.model):
         return _error(
             f"The model `{req.model}` does not exist. Available models: "
             f"{', '.join(MODEL_MAP)}",
-            status=404, err_type="model_not_found",
+            status=404,
+            err_type="model_not_found",
         )
 
     # A thread's model is fixed when it's created, so on resume we ignore `model`
     # (the OpenAI SDK always sends one) and let the existing thread's model stand.
-    model_type = None if req.conversation_id else resolve_model_type(req.model)
-    prompt = messages_to_prompt(req.messages)
+    #
+    # If DEEPSEEK_SESSION_ID is set, pin every request to that session so all
+    # turns appear in the same DeepSeek UI chat. The client's own conversation_id
+    # (from a previous response) takes precedence — it already encodes the right
+    # session + parent message for multi-turn threading.
+    effective_cid = req.conversation_id or (
+        DEEPSEEK_SESSION_ID if DEEPSEEK_SESSION_ID else None
+    )
+    model_type = None if effective_cid else resolve_model_type(req.model)
+    prompt, has_tools = messages_to_prompt(req.messages, tools=req.tools)
 
     try:
         # Off the event loop: get_client() uses Playwright's sync API, which
@@ -124,21 +149,48 @@ async def chat_completions(req: ChatCompletionRequest):
         return _error(f"Failed to initialise DeepSeek session: {e}")
 
     if req.stream:
+
         def gen():
             stream = client.stream(
-                prompt, conversation_id=req.conversation_id,
-                model=model_type, thinking=req.thinking, search=req.search,
+                prompt,
+                conversation_id=effective_cid,
+                model=model_type,
+                thinking=req.thinking,
+                search=req.search,
             )
-            yield from stream_chunks(req.model, stream)
+            yield from stream_chunks(req.model, stream, tools=req.tools)
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     try:
         reply = await run_in_threadpool(
-            client.chat, prompt, req.conversation_id,
-            model_type, req.thinking, req.search,
+            client.chat,
+            prompt,
+            effective_cid,
+            model_type,
+            req.thinking,
+            req.search,
         )
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 
-    return completion_response(req.model, reply.text, prompt, reply.conversation_id)
+    # Parse tool calls from the response if tools were provided
+    tool_calls = None
+    content = reply.text
+    if req.tools:
+        content, tool_calls = _parse_tool_calls(reply.text, tools=req.tools)
+        if not tool_calls:
+            _log.warning(
+                "Tool call expected but model returned plain text. "
+                "Model may have narrated instead of using <tool_call> tags. "
+                "Response: %.200s",
+                content,
+            )
+
+    return completion_response(
+        req.model,
+        content,
+        prompt,
+        reply.conversation_id,
+        tool_calls=tool_calls,
+    )

@@ -279,3 +279,15 @@ Released under the [MIT License](LICENSE). As this is an unofficial project, you
 
 ---
 
+## Credits
+
+This project is a fork of [sums001/Deepseek-API](https://github.com/sums001/Deepseek-API). Many thanks to the original author for the core implementation — auth, PoW solver, HTTP client, and server skeleton.
+
+Additions in this fork:
+- OpenAI-compatible tool/function calling with multi-format parser (standard JSON, named-attribute, Anthropic XML, direct-tag)
+- Session pinning via `DEEPSEEK_SESSION_ID` to reuse a single DeepSeek chat across all requests
+- `AGENTS.md` for AI coding agent context
+
+---
+
+
