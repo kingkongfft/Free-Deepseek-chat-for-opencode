@@ -1,0 +1,17 @@
+.git
+.gitignore
+.ruff_cache
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+session/
+logs/
+*.log
+debug_continuation.txt
+nul
+.env
+examples/
+tools/
+$RepoDir/

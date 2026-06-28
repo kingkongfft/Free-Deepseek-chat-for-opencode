@@ -1,0 +1,31 @@
+services:
+  deepseek-api:
+    build: .
+    container_name: deepseek-api
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      # Mount the host session/ dir so Chrome profile/cookies persist.
+      # Run `python -m deepseek.auth` on the HOST once before starting.
+      - ./session:/app/session
+    environment:
+      HOST: "0.0.0.0"           # must bind to all interfaces inside container
+      PORT: "8000"
+      SERVER_INTERACTIVE_LOGIN: "0"   # no interactive browser inside Docker
+      DEEPSEEK_PROFILE_DIR: "session/profile"
+      # Optional overrides — uncomment or set in a .env file:
+      # RATE_LIMIT_PER_MINUTE: "30"
+      # DEEPSEEK_SESSION_ID: ""
+      # LOG_LEVEL: "INFO"
+    env_file:
+      - path: .env
+        required: false         # .env is optional; env vars above are defaults
+    restart: unless-stopped
+    # Chromium requires a larger /dev/shm to avoid crashes
+    shm_size: "256m"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
