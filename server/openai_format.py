@@ -78,6 +78,15 @@ def _text_of(content) -> str:
     return "\n".join(parts)
 
 
+def _has_file_parts(content) -> bool:
+    """Return True if content contains any inlined file/document parts."""
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(p, dict) and p.get("type") in ("file", "document") for p in content
+    )
+
+
 def _example_for_tool(tools: List[Tool]) -> str:
     """Generate a concrete few-shot example using the first available tool."""
     if not tools:
@@ -422,11 +431,17 @@ def messages_to_prompt(
     """
     has_tools = False
 
+    # If the last user message already contains inlined file content (opencode @mention),
+    # skip tool injection entirely — the model should answer directly from the inline content.
+    last_user = next((m for m in reversed(messages) if m.role == "user"), None)
+    files_inlined = last_user is not None and _has_file_parts(last_user.content)
+    effective_tools = None if files_inlined else tools
+
     # Fast path: single user message
     if len(messages) == 1 and messages[0].role == "user":
         text = _text_of(messages[0].content)
-        if tools:
-            tool_section = _format_tool_definitions(tools)
+        if effective_tools:
+            tool_section = _format_tool_definitions(effective_tools)
             text = f"{tool_section}\n\nUser: {text}"
             has_tools = True
         return text, has_tools
@@ -444,14 +459,14 @@ def messages_to_prompt(
     # continuation prompt. Otherwise the massive opencode system prompt
     # (500+ lines) comes after our "output ONLY a <tool_call>" instruction
     # and contradicts it, causing the model to narrate instead of tool-calling.
-    if ends_with_tool_result and tools:
+    if ends_with_tool_result and effective_tools:
         for m in messages:
             if m.role == "system":
                 sys_text = _text_of(m.content)
                 if sys_text:
                     lines.append(f"System: {sys_text}")
 
-    if tools:
+    if effective_tools:
         has_tools = True
         if ends_with_tool_result:
             # Show only the last 10 completed steps to keep prompt compact
@@ -466,10 +481,10 @@ def messages_to_prompt(
             completed = "\n".join(completed_lines)
             completed_block = f"\nAlready completed:\n{completed}" if completed else ""
             # Compact long tool lists (opencode sends 60+ tools)
-            if len(tools) > 10:
+            if len(effective_tools) > 10:
                 common = [
                     t.function.name
-                    for t in tools
+                    for t in effective_tools
                     if t.function.name
                     in {
                         "bash",
@@ -484,12 +499,12 @@ def messages_to_prompt(
                         "skill",
                     }
                 ]
-                remaining = len(tools) - len(common)
+                remaining = len(effective_tools) - len(common)
                 tool_names = ", ".join(f"`{n}`" for n in common)
                 if remaining > 0:
                     tool_names += f" (and {remaining} more)"
             else:
-                tool_names = ", ".join(f"`{t.function.name}`" for t in tools)
+                tool_names = ", ".join(f"`{t.function.name}`" for t in effective_tools)
             lines.append(
                 f"System: You are a helpful assistant with access to tools: {tool_names}.\n"
                 f"{completed_block}\n"
@@ -504,12 +519,12 @@ def messages_to_prompt(
                 f"</tool_call>"
             )
         else:
-            tool_section = _format_tool_definitions(tools)
+            tool_section = _format_tool_definitions(effective_tools)
             lines.append(f"System: {tool_section}")
 
     for m in messages:
         if m.role == "system":
-            if ends_with_tool_result and tools:
+            if ends_with_tool_result and effective_tools:
                 continue  # already emitted above (before continuation prompt)
             sys_text = _text_of(m.content)
             if sys_text:

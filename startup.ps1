@@ -26,10 +26,18 @@ if (Test-Path $EnvFile) {
 if (-not $env:HOST)  { $env:HOST  = "127.0.0.1" }
 if (-not $env:PORT)  { $env:PORT  = "8000" }
 
-# Kill any existing instance on the same port
-$portPid = (netstat -ano 2>$null | Select-String ":$($env:PORT)\s.*LISTENING" | ForEach-Object {
-    ($_ -split '\s+')[-1]
-}) | Select-Object -First 1
+# Kill any existing instance — try Get-NetTCPConnection first (reliable),
+# fall back to netstat parsing (works across session boundaries).
+$portPid = $null
+try {
+    $conn = Get-NetTCPConnection -LocalPort ([int]$env:PORT) -ErrorAction SilentlyContinue
+    if ($conn) { $portPid = $conn.OwningProcess | Select-Object -First 1 }
+} catch {}
+if (-not $portPid) {
+    $portPid = (netstat -ano 2>$null | Select-String ":$($env:PORT)\s.*LISTENING" | ForEach-Object {
+        ($_ -split '\s+')[-1]
+    }) | Select-Object -First 1
+}
 if ($portPid) {
     Stop-Process -Id ([int]$portPid) -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
