@@ -46,6 +46,7 @@ from .openai_format import (
     messages_to_prompt,
     stream_chunks,
     _parse_tool_calls,
+    suppress_spurious_tool_call,
 )
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest
@@ -209,7 +210,10 @@ async def chat_completions(req: ChatCompletionRequest):
                 search=req.search,
             )
             yield from stream_chunks(
-                req.model, stream, tools=None if files_inlined else req.tools
+                req.model,
+                stream,
+                tools=req.tools if has_tools else None,
+                messages=req.messages,
             )
 
         return StreamingResponse(gen(), media_type="text/event-stream")
@@ -226,13 +230,13 @@ async def chat_completions(req: ChatCompletionRequest):
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 
-    # Parse tool calls from the response if tools were provided.
-    # Skip when files were inlined (@mention) — the model answers directly,
-    # any tool-call-shaped text in the response is a hallucination, not a real call.
+    # Parse tool calls only when tools were actually injected into the prompt.
+    # Skip when: files were inlined (@mention), or a loop was detected (has_tools=False).
     tool_calls = None
     content = reply.text
-    if req.tools and not files_inlined:
+    if req.tools and has_tools:
         content, tool_calls = _parse_tool_calls(reply.text, tools=req.tools)
+        content, tool_calls = suppress_spurious_tool_call(req.messages, content, tool_calls)
         if not tool_calls:
             _log.warning(
                 "Tool call expected but model returned plain text. "

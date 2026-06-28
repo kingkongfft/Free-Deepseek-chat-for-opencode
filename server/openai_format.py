@@ -432,6 +432,151 @@ def _summarise_completed_tool_calls(messages: List[ChatMessage]) -> str:
     return "\n".join(done)
 
 
+def _latest_completed_tool(
+    messages: List[ChatMessage],
+) -> Tuple[Optional[str], Optional[str]]:
+    last_tool_result = None
+    for m in reversed(messages):
+        if last_tool_result is None and m.role == "tool":
+            last_tool_result = _text_of(m.content) if m.content else ""
+        if m.role == "assistant" and m.tool_calls:
+            fn = m.tool_calls[-1].get("function", {})
+            return fn.get("name"), last_tool_result
+    return None, last_tool_result
+
+
+def _latest_read_like_result(messages: List[ChatMessage]) -> Optional[str]:
+    pending_call_ids = set()
+    for m in reversed(messages):
+        if m.role == "assistant" and m.tool_calls:
+            for tc in m.tool_calls:
+                fn = tc.get("function", {})
+                if fn.get("name") in {"read", "grep", "glob", "webfetch"}:
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        pending_call_ids.add(tc_id)
+        elif m.role == "tool" and m.tool_call_id and m.tool_call_id in pending_call_ids:
+            return _text_of(m.content) if m.content else ""
+    return None
+
+
+def _extract_text_from_read_result(tool_result: Optional[str]) -> Optional[str]:
+    if not tool_result:
+        return None
+    content_match = re.search(
+        r"<content>\s*(.*?)\s*(?:\(End of file.*?\))?\s*</content>",
+        tool_result,
+        re.DOTALL,
+    )
+    if not content_match:
+        return None
+    lines = []
+    for line in content_match.group(1).splitlines():
+        lines.append(re.sub(r"^\s*\d+:\s?", "", line))
+    return "\n".join(lines).strip() or None
+
+
+def _looks_like_display_text(command: str) -> bool:
+    cmd = command.strip()
+    if not cmd:
+        return False
+    lowered = cmd.lower()
+    if lowered.startswith("markdown\n") or lowered.startswith("md\n"):
+        return True
+    if "\n" not in cmd:
+        return False
+    lines = [line.rstrip() for line in cmd.splitlines() if line.strip()]
+    if not lines:
+        return False
+    if lines[0].startswith("#"):
+        return True
+    markdown_lines = sum(
+        1
+        for line in lines
+        if line.startswith("#")
+        or line.startswith("- ")
+        or line.startswith("* ")
+        or re.match(r"^\d+\.\s", line)
+    )
+    prose_lines = sum(1 for line in lines if len(line.split()) >= 4)
+    return markdown_lines >= 1 or prose_lines >= 2
+
+
+def _display_text_from_command(command: str) -> str:
+    cmd = command.strip()
+    for prefix in ("markdown\n", "md\n"):
+        if cmd.lower().startswith(prefix):
+            return cmd[len(prefix) :].lstrip()
+    return cmd
+
+
+def _looks_like_file_display_command(command: str) -> bool:
+    cmd = command.strip().lower()
+    return bool(re.fullmatch(r"(?:get-content|cat|type)\s+.*", cmd))
+
+
+def _command_arg_from_tool_call(arguments: str) -> Optional[str]:
+    try:
+        parsed = json.loads(arguments or "{}")
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        command = parsed.get("command")
+        if isinstance(command, str):
+            return command
+    match = re.search(r'"command"\s*:\s*"(.*)"\s*\}\s*$', arguments or "", re.DOTALL)
+    if not match:
+        return None
+    raw = match.group(1)
+    return (
+        raw.replace("\\r", "\r")
+        .replace("\\n", "\n")
+        .replace('\\"', '"')
+        .replace("\\\\", "\\")
+    )
+
+
+def suppress_spurious_tool_call(
+    messages: List[ChatMessage],
+    content: str,
+    tool_calls: Optional[List[Dict[str, Any]]],
+) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+    if not tool_calls or len(tool_calls) != 1:
+        return content, tool_calls
+
+    tool_call = tool_calls[0]
+    fn = tool_call.get("function", {})
+    if fn.get("name") != "bash":
+        return content, tool_calls
+
+    command = _command_arg_from_tool_call(fn.get("arguments") or "") or ""
+    if not isinstance(command, str) or not command.strip():
+        return content, tool_calls
+
+    if _looks_like_display_text(command):
+        text_out = _display_text_from_command(command)
+        _log.warning(
+            "Suppressing suspicious bash display call and returning plain text."
+        )
+        return text_out, None
+
+    last_tool_name, last_tool_result = _latest_completed_tool(messages)
+    read_like_result = _latest_read_like_result(messages)
+    if _looks_like_file_display_command(command) and (
+        last_tool_name in {"read", "grep", "glob", "webfetch"} or read_like_result
+    ):
+        source_result = read_like_result or last_tool_result
+        extracted = _extract_text_from_read_result(source_result) or source_result
+        if extracted:
+            _log.warning(
+                "Suppressing redundant bash display call after `%s` and returning tool result text.",
+                last_tool_name or "read-like tool",
+            )
+            return extracted, None
+
+    return content, tool_calls
+
+
 def messages_to_prompt(
     messages: List[ChatMessage],
     tools: Optional[List[Tool]] = None,
@@ -457,39 +602,57 @@ def messages_to_prompt(
     files_inlined = last_user is not None and _has_file_parts(last_user.content)
     effective_tools = None if files_inlined else tools
 
-    # Detect tool-call loops: if the last 2+ assistant messages all made the
-    # exact same tool call (same name + same arguments), the model is stuck.
-    # Strip all repeated loop iterations from history, keeping only the first
-    # call + result, and inject a warning so the model breaks out.
+    # Detect tool-call loops: the model is stuck if either:
+    #   (a) the exact same tool call (name + args) is repeated 2+ times, OR
+    #   (b) the same tool name is called 3+ times in a row (args may vary slightly).
+    # When a loop is detected, disable tool injection entirely and force plain text.
     loop_warning = ""
-    if tools and not files_inlined:
-        # Collect (name, args) for recent consecutive assistant tool calls
+    if effective_tools:
+        # Collect (name, args) for all consecutive trailing assistant tool calls
         recent_calls = []
         for m in reversed(messages):
-            if m.role in ("tool", "assistant"):
-                if m.role == "assistant" and m.tool_calls:
-                    for tc in m.tool_calls:
-                        fn = tc.get("function", {})
-                        recent_calls.append((fn.get("name"), fn.get("arguments")))
+            if m.role == "tool":
+                continue  # skip tool result messages, keep scanning
+            if m.role == "assistant" and m.tool_calls:
+                for tc in m.tool_calls:
+                    fn = tc.get("function", {})
+                    recent_calls.append((fn.get("name"), fn.get("arguments")))
             else:
-                break
-        if len(recent_calls) >= 3:
-            # Check if all calls are identical
+                break  # stop at user/system message
+
+        loop_name = None
+        loop_count = 0
+
+        if len(recent_calls) >= 2:
+            # (a) Identical name + args repeated
             unique = set((n, a) for n, a in recent_calls)
             if len(unique) == 1:
-                loop_name, loop_args = list(unique)[0]
-                loop_warning = (
-                    f"\n\nWARNING: The tool call `{loop_name}` with the same arguments "
-                    f"has been attempted {len(recent_calls)} times and keeps failing. "
-                    f"DO NOT call `{loop_name}` again with these arguments. "
-                    f"Instead, respond in plain text to answer the user's question directly."
-                )
-                _log.warning(
-                    "Tool call loop detected: %s called %d times with same args. "
-                    "Injecting loop-break warning into prompt.",
-                    loop_name,
-                    len(recent_calls),
-                )
+                loop_name = list(unique)[0][0]
+                loop_count = len(recent_calls)
+
+        if loop_name is None and len(recent_calls) >= 2:
+            # (b) Same tool name repeated 2+ times regardless of args
+            from collections import Counter
+
+            name_counts = Counter(n for n, _ in recent_calls)
+            most_common_name, most_common_count = name_counts.most_common(1)[0]
+            if most_common_count >= 2:
+                loop_name = most_common_name
+                loop_count = most_common_count
+
+        if loop_name is not None:
+            loop_warning = (
+                f"IMPORTANT: The tool call `{loop_name}` has been attempted "
+                f"{loop_count} times and keeps failing. "
+                f"DO NOT call any tools. Respond in plain text to answer the user's question directly."
+            )
+            effective_tools = None  # disable tool injection — force plain text response
+            _log.warning(
+                "Tool call loop detected: %s called %d times — "
+                "disabling tool injection to force plain text.",
+                loop_name,
+                loop_count,
+            )
 
     # Fast path: single user message
     if len(messages) == 1 and messages[0].role == "user":
@@ -627,10 +790,11 @@ def messages_to_prompt(
             label = _ROLE_LABELS.get(m.role, m.role.capitalize())
             text = _text_of(m.content)
             if text:
-                # Append loop-break warning to the last user message
-                if loop_warning and m is messages[-1] and m.role == "user":
-                    text = text + loop_warning
                 lines.append(f"{label}: {text}")
+
+    # Inject loop-break warning as final system instruction before "Assistant:"
+    if loop_warning:
+        lines.append(f"System: {loop_warning}")
 
     lines.append("Assistant:")
     return "\n\n".join(lines), has_tools, files_inlined
@@ -697,6 +861,7 @@ def stream_chunks(
     model: str,
     stream: Iterable[str],
     tools: Optional[List[Tool]] = None,
+    messages: Optional[List[ChatMessage]] = None,
 ) -> Iterable[str]:
     """Yield OpenAI SSE lines (`data: {...}\\n\\n`) for a streamed completion.
 
@@ -729,6 +894,10 @@ def stream_chunks(
 
         full_text = "".join(buffer)
         cleaned_text, tool_calls = _parse_tool_calls(full_text, tools=tools)
+        if messages:
+            cleaned_text, tool_calls = suppress_spurious_tool_call(
+                messages, cleaned_text, tool_calls
+            )
 
         if tool_calls:
             # Yield role chunk
