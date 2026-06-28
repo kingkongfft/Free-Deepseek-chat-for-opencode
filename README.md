@@ -1,142 +1,139 @@
-# DeepSeek API: a free LLM API powered by DeepSeek
+# DeepSeek API: free DeepSeek for opencode and any OpenAI-compatible client
 
-**Using your own DeepSeek account.** No API key, no credits, no paid plan: it turns the free chat at [chat.deepseek.com](https://chat.deepseek.com) into an API you can call from code.
+**Using your own DeepSeek account.** No API key, no credits, no paid plan — turns the free chat at [chat.deepseek.com](https://chat.deepseek.com) into a local API server you can wire into [opencode](https://opencode.ai), Cursor, Continue, or any OpenAI-compatible tool.
 
-You can use it in two ways:
+This fork adds full **tool calling support** so AI coding agents like opencode can run their complete workflow — reading and writing files, running shell commands, building skills, and more — entirely through the free DeepSeek web interface.
 
-- 🐍 **As a Python library:** just call `client.chat("Hi")`. Supports streaming and multi-turn conversations.
-- 🔌 **As a local OpenAI-compatible API:** runs a server at `http://localhost:8000/v1` that speaks the OpenAI format, so the official `openai` SDK (and any OpenAI-compatible app) works as a drop-in, with `localhost` in place of OpenAI.
-
-You sign in once in a browser with your DeepSeek account; your session is saved and refreshed automatically after that.
-
-> **Unofficial project.** Not affiliated with or endorsed by DeepSeek. It automates the consumer DeepSeek web experience for personal use, so use it responsibly and within DeepSeek's terms.
+> **Unofficial project.** Not affiliated with or endorsed by DeepSeek. Automates the consumer DeepSeek web experience for personal use — use responsibly and within DeepSeek's terms.
 
 ---
 
-## Table of contents
+## What this fork adds
 
-- [Why use this?](#why-use-this)
-- [Requirements](#requirements)
-- [Setup (2 minutes)](#setup-2-minutes)
-- [Usage 1: In Python (no server)](#usage-1-in-python-no-server)
-- [Usage 2: As an OpenAI-compatible server](#usage-2-as-an-openai-compatible-server)
-- [Command line](#command-line)
-- [Human-check & proof-of-work (automatic)](#human-check--proof-of-work-automatic)
-- [Models, DeepThink & web search](#models-deepthink--web-search)
-- [Concurrency](#concurrency)
-- [Rate limiting](#rate-limiting)
-- [Project layout](#project-layout)
-- [Notes & limitations](#notes--limitations)
-- [License](#license)
+The original [sums001/Deepseek-API](https://github.com/sums001/Deepseek-API) provides the core bridge (auth, PoW solver, HTTP client, FastAPI server). This fork adds:
+
+| Feature | Detail |
+|---|---|
+| **Tool / function calling** | Full OpenAI-compatible `tools` field — definitions injected via prompt, model output parsed into `tool_calls` response |
+| **Multi-format parser** | Handles 4 output variants DeepSeek produces: standard JSON, named-attribute XML, Anthropic `<invoke>` XML (parallel calls), and direct tool-name tags |
+| **opencode compatibility** | All 9 opencode built-in tools (`bash`, `read`, `write`, `edit`, `glob`, `grep`, `webfetch`, `todowrite`, `task`) tested and working |
+| **Session pinning** | `DEEPSEEK_SESSION_ID` env var pins all requests to one existing chat — no new chat created per prompt |
+| **Streaming tool calls** | Tool calls are buffered and streamed in OpenAI SSE format with correct `finish_reason: "tool_calls"` |
 
 ---
 
-## Why use this?
+## opencode quick start
 
-- **Free:** uses your normal signed-in DeepSeek account, no API billing.
-- **Drop-in OpenAI replacement:** point any OpenAI client at `localhost` and it just works.
-- **Full DeepSeek toolset:** pick the fast or expert model, and toggle DeepThink reasoning and web search per request.
-- **Streaming + conversations:** token-by-token output and multi-turn threads addressed by `conversation_id`.
-
----
-
-## Requirements
-
-- **Python 3.9+**
-- A **DeepSeek account** (the free one you use for [chat.deepseek.com](https://chat.deepseek.com) is fine)
-- Works on Windows, macOS, and Linux
-
----
-
-## Setup (2 minutes)
-
-```bash
-# 1. Clone the project
-git clone <your-repo-url>
-cd "Deepseek-API"
-```
-
-**2. Create and activate a virtual environment**
-
-On **macOS / Linux**:
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-On **Windows** (PowerShell):
+**1. Start the server**
 
 ```powershell
-python -m venv venv
-venv\Scripts\Activate.ps1
-```
-
-> On Windows you may need to allow script execution once: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. In `cmd.exe` activate with `venv\Scripts\activate.bat` instead.
-
-**3. Install dependencies and sign in**
-
-```bash
-# Install dependencies
+git clone https://github.com/kingkongfft/Deepseek-API
+cd Deepseek-API
+python -m venv venv && venv\Scripts\activate
 pip install -r requirements.txt
-
-# Install the browser Playwright needs (one-time)
 playwright install chromium
-
-# Sign in once: a browser opens, log into your DeepSeek account
-python -m deepseek.auth
+python -m deepseek.auth        # sign in once — browser opens
+python app.py                  # server at http://127.0.0.1:8000
 ```
 
-The login window opens so you can sign in by hand and solve the human-check once. After that your session (bearer token + cookies) is saved under `session/` (git-ignored, never shared) and reused on every run — the cached session is refreshed automatically, so your first request works right away.
+**2. Configure opencode** — add to your `opencode.json`:
 
-> The server can also open this window for you on demand the first time it needs a session, so this step is optional for local single-user use.
+```json
+{
+  "provider": {
+    "deepseek-local": {
+      "name": "DeepSeek Local (Free)",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "unused"
+      },
+      "models": {
+        "deepseek-chat": {
+          "name": "DeepSeek Chat (Local)",
+          "limit": { "context": 65536, "output": 8192 }
+        },
+        "deepseek-expert": {
+          "name": "DeepSeek Expert (Local)",
+          "limit": { "context": 65536, "output": 8192 }
+        }
+      }
+    }
+  }
+}
+```
+
+**3. (Optional) Pin to a single chat session** so all turns appear in one DeepSeek UI thread:
+
+```powershell
+# Copy the UUID from: https://chat.deepseek.com/a/chat/s/<UUID>
+$env:DEEPSEEK_SESSION_ID="your-session-uuid-here"
+python app.py
+```
 
 ---
 
-## Usage 1: In Python (no server)
+## Tool calling
 
-The simplest way if your code is already Python.
+Tool definitions sent in the `tools` field are injected into the prompt. The model's output is parsed for tool calls and returned in standard OpenAI format. The parser handles every output variant DeepSeek produces:
+
+| Format | Example |
+|---|---|
+| Standard JSON | `<tool_call>{"name": "bash", "arguments": {"command": "ls"}}</tool_call>` |
+| Named attribute | `<tool_call name="bash">{"command": "ls"}</tool_call>` |
+| Anthropic XML | `<tool_calls><invoke name="bash"><parameter name="command">ls</parameter></invoke></tool_calls>` |
+| Direct tag | `<bash>{"command": "ls"}</bash>` |
+
+Multiple parallel tool calls in one response (Anthropic XML format) are fully supported.
+
+### opencode tool names (confirmed from binary analysis)
+
+| Tool | Required params | Optional params |
+|---|---|---|
+| `bash` | `command` | `timeout`, `workdir` |
+| `read` | `filePath` | `offset`, `limit` |
+| `write` | `filePath`, `content` | — |
+| `edit` | `filePath`, `oldString`, `newString` | `replaceAll` |
+| `glob` | `pattern` | `path` |
+| `grep` | `pattern` | `path`, `include` |
+| `webfetch` | `url` | `format` |
+| `todowrite` | `todos` | — |
+| `task` | `description`, `prompt`, `subagent_type` | `task_id` |
+
+See [TOOL_CALLING_IMPROVEMENTS.md](TOOL_CALLING_IMPROVEMENTS.md) for full technical detail.
+
+---
+
+## General usage
+
+### As a Python library
 
 ```python
 from deepseek import DeepSeekClient
 
-client = DeepSeekClient()                # loads your signed-in session
-
-# Get a full reply
+client = DeepSeekClient()
 reply = client.chat("Say hello in one short sentence.")
 print(reply.text)
 
-# Continue the SAME conversation — pass the id back
+# Continue the same conversation
 reply2 = client.chat("And now in French?", conversation_id=reply.conversation_id)
 print(reply2.text)
 
-# Stream the answer as it's typed
+# Stream token by token
 for chunk in client.stream("Tell me a short joke"):
     print(chunk, end="", flush=True)
 ```
 
-`chat()` returns the full text plus a `conversation_id`; pass that id back to keep the thread going, or omit it to start fresh. `stream()` yields the reply piece by piece.
-
-👉 More: [examples/01_direct_chat.py](examples/01_direct_chat.py), [02_direct_conversation.py](examples/02_direct_conversation.py), [03_direct_stream.py](examples/03_direct_stream.py)
-
----
-
-## Usage 2: As an OpenAI-compatible server
-
-Start a local server that speaks the OpenAI API, so existing OpenAI tools and SDKs work unchanged.
+### As an OpenAI-compatible server
 
 ```bash
 python app.py
-# -> DeepSeek OpenAI-compatible API on http://127.0.0.1:8000
+# -> http://127.0.0.1:8000/v1
 ```
-
-Then point any OpenAI client at it (the API key is required by the SDK but ignored):
 
 ```python
 from openai import OpenAI
-
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
-
 resp = client.chat.completions.create(
     model="deepseek-chat",
     messages=[{"role": "user", "content": "Hello!"}],
@@ -144,150 +141,80 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-Or call it with plain HTTP / `curl`:
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "deepseek-chat", "messages": [{"role": "user", "content": "Hello!"}]}'
-```
-
 **Endpoints**
 
 | Method | Path | Description |
-| --- | --- | --- |
-| `POST` | `/v1/chat/completions` | Chat (supports `"stream": true`, plus optional `"conversation_id"`, `"thinking"`, `"search"`) |
-| `GET`  | `/v1/models` | Lists the available models |
-| `GET`  | `/healthz` | Health check (rate-limit exempt) |
-
-> Change the address with env vars: `HOST=0.0.0.0 PORT=8080 python app.py`, or run `uvicorn server.api:app --host 0.0.0.0 --port 8080`.
-
-👉 More: [examples/04_server_http.py](examples/04_server_http.py), [examples/05_server_stream.py](examples/05_server_stream.py), [examples/06_server_openai_sdk.py](examples/06_server_openai_sdk.py)
+|---|---|---|
+| `POST` | `/v1/chat/completions` | Chat — supports `stream`, `tools`, `conversation_id`, `thinking`, `search` |
+| `GET` | `/v1/models` | List available models |
+| `GET` | `/healthz` | Health check |
 
 ---
 
-## Command line
+## Environment variables
 
-```bash
-python -m deepseek.auth          # sign in and save the session
-```
-
----
-
-## Human-check & proof-of-work (automatic)
-
-DeepSeek's chat sits behind two gates, both handled for you:
-
-- **AWS WAF human-check:** access needs a signed-in browser session that has
-  cleared the "verify you're human" check. `python -m deepseek.auth` opens a real
-  browser so you can sign in and solve it once; the resulting token + cookies are
-  cached under `session/` and reused on every request.
-- **Proof-of-work:** every completion is gated by a PoW challenge. The bridge
-  solves it by running DeepSeek's own `sha3_wasm_bg.wasm` module — the same one
-  the browser loads — inside a `wasmtime` sandbox, so there's nothing to do on
-  your end.
-
-A cached session is reused for ~6 hours and refreshed headlessly from your saved
-Chrome profile when possible; only a full expiry sends you back to the browser.
+| Var | Default | Purpose |
+|---|---|---|
+| `HOST` | `127.0.0.1` | Server bind host |
+| `PORT` | `8000` | Server port |
+| `RATE_LIMIT_PER_MINUTE` | `30` | Per-IP rate limit |
+| `DEEPSEEK_SESSION_ID` | _(none)_ | Pin all requests to one chat session (UUID from `chat.deepseek.com/a/chat/s/<ID>`) |
+| `SERVER_INTERACTIVE_LOGIN` | `1` | Open browser automatically on missing session |
+| `DEEPSEEK_PROFILE_DIR` | `session/profile` | Chrome profile directory for session reuse |
 
 ---
 
-## Models, DeepThink & web search
+## Models
 
-The `model` name selects **which model** answers. DeepThink and web search are
-**not** models — they're orthogonal toggles you pass per request.
+| Model name | DeepSeek mode | Notes |
+|---|---|---|
+| `deepseek-chat` | Instant | Fast, reliable tool calling |
+| `deepseek-expert` | Expert | Stronger reasoning, less reliable tool format |
 
-| Model | DeepSeek mode | Notes |
-| --- | --- | --- |
-| `deepseek-chat` | Instant | Fast default model |
-| `deepseek-expert` | Expert | Stronger, slower |
-
-Pass `thinking: true` (DeepThink reasoning) and/or `search: true` (web search) in
-the request body — or via the OpenAI SDK's `extra_body`:
+Toggle DeepThink reasoning and web search per request via `extra_body`:
 
 ```python
 resp = client.chat.completions.create(
     model="deepseek-expert",
-    messages=[{"role": "user", "content": "What changed in the news today?"}],
+    messages=[{"role": "user", "content": "What's in the news today?"}],
     extra_body={"thinking": True, "search": True},
 )
 ```
-
-`conversation_id`, `thinking`, and `search` are non-OpenAI extras. A thread's
-model is fixed at creation, so `model` can't be combined with `conversation_id`
-on resume. Unknown model names return a `404` (no silent fallback). See
-[server/config.py](server/config.py).
-
----
-
-## Concurrency
-
-The server bridges a **single** signed-in DeepSeek account behind one shared
-client. The PoW solver's `wasmtime` store isn't reentrant, so upstream calls are
-**serialized**: parallel HTTP requests queue behind a lock and run one at a time
-(see [server/api.py](server/api.py)). This is intentional — throughput is
-sequential, not parallel. Keep concurrent in-flight requests low, and please
-don't hammer your account.
-
----
-
-## Rate limiting
-
-On top of serialization, the bridge enforces a self-imposed rate limit with a
-dependency-free sliding-window limiter ([server/ratelimit.py](server/ratelimit.py)):
-it caps accepted requests **per client IP** and returns a standard `429` +
-`Retry-After` when you exceed it. `/healthz` is exempt.
-
-| Env var | Default | Meaning |
-| --- | --- | --- |
-| `RATE_LIMIT_PER_MINUTE` | `30` | Requests/minute accepted per client IP |
-
-```bash
-RATE_LIMIT_PER_MINUTE=60 python app.py   # raise it
-```
-
-**On the client side, use exponential backoff.** Transient `429`s clear if you
-retry with growing delays (e.g. 1s, 2s, 4s). The official `openai` SDK does this
-automatically and honours `Retry-After`; with plain HTTP, add a few retries
-yourself.
 
 ---
 
 ## Project layout
 
 | Path | What it does |
-| --- | --- |
-| [deepseek/](deepseek/) | The core library: `DeepSeekClient`, auth/browser sign-in ([auth.py](deepseek/auth.py)), the HTTP driver ([client.py](deepseek/client.py)), and the PoW solver ([pow.py](deepseek/pow.py)) |
-| [server/](server/) | The FastAPI OpenAI-compatible server |
-| [examples/](examples/) | Runnable examples for every feature ([examples/README.md](examples/README.md)) |
-| [app.py](app.py) | Starts the server |
+|---|---|
+| `deepseek/` | Core library — auth, HTTP client, PoW solver |
+| `server/api.py` | FastAPI endpoints |
+| `server/openai_format.py` | Prompt formatting + multi-format tool call parser |
+| `server/schemas.py` | Pydantic request/response models |
+| `server/config.py` | Model map, rate limit, env vars |
+| `examples/` | Runnable examples |
+| `AGENTS.md` | Context file for AI coding agents |
+| `TOOL_CALLING_IMPROVEMENTS.md` | Full tool calling implementation notes |
 
 ---
 
 ## Notes & limitations
 
-- **Sign in once, then reuse.** The cached session refreshes automatically; you only re-sign-in if it fully expires.
-- **Be reasonable.** Please use it in moderation, and don't spam or hammer it with automated bulk requests.
-- **No real token counts.** `usage` in responses is a rough ~4-chars/token estimate.
-- **Most OpenAI params are accepted but ignored** (`temperature`, `top_p`, `max_tokens`); only `model`, `messages`, `stream`, `conversation_id`, `thinking`, and `search` do anything.
-- **Vision is deferred.** It needs image-upload plumbing that isn't built yet.
-- **Your session is private.** Everything in `session/` (cookies + token) stays on your machine and is git-ignored.
+- **`deepseek-chat` is more reliable than `deepseek-expert` for tool calling** — the expert model sometimes narrates instead of emitting a tool call block. The parser handles 4 fallback formats but pure-prose failures are unrecoverable without a retry mechanism.
+- **PoW is serialized** — all requests queue behind a lock. Don't run heavy parallel workloads.
+- **Session pinning** reuses one chat thread — very long sessions may hit DeepSeek's context limit.
+- **No real token counts** — `usage` is a rough `~4 chars/token` estimate.
+- **Most OpenAI params ignored** — `temperature`, `top_p`, `max_tokens` are accepted but have no effect.
+- **Your session is private** — `session/` is git-ignored and never leaves your machine.
+
+---
 
 ## License
 
-Released under the [MIT License](LICENSE). As this is an unofficial project, you remain responsible for complying with DeepSeek's terms of service.
+[MIT License](LICENSE). This is an unofficial project — you remain responsible for complying with DeepSeek's terms of service.
 
 ---
 
 ## Credits
 
-This project is a fork of [sums001/Deepseek-API](https://github.com/sums001/Deepseek-API). Many thanks to the original author for the core implementation — auth, PoW solver, HTTP client, and server skeleton.
-
-Additions in this fork:
-- OpenAI-compatible tool/function calling with multi-format parser (standard JSON, named-attribute, Anthropic XML, direct-tag)
-- Session pinning via `DEEPSEEK_SESSION_ID` to reuse a single DeepSeek chat across all requests
-- `AGENTS.md` for AI coding agent context
-
----
-
-
+Built on top of [sums001/Deepseek-API](https://github.com/sums001/Deepseek-API). Many thanks to the original author for the auth flow, PoW solver, HTTP client, and FastAPI server skeleton that make this possible.
