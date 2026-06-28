@@ -140,6 +140,21 @@ Only attempted when all above formats match nothing and tool names are known fro
 ````
 Model outputs a markdown code block containing a `{"name":..,"arguments":..}` object instead of using `<tool_call>` tags. This was the root cause of the "infinite loop" bug where opencode displayed the JSON but never executed it (tool_calls was empty), and the user had to keep typing "continue".
 
+### Format 6 — Fenced shell block (last resort, bash only)
+````
+```bash
+npx kill-port 3000 && npm start
+```
+````
+Model outputs a bare shell code block with no JSON at all. Matched only when tools were requested and all other formats failed. Wrapped as a `bash` tool call with `{"command": "<cmd>"}`. Only the first fenced block is taken.
+
+### Format 7 — Split hyphenated XML tags (`deepseek-expert` failure mode)
+```
+<function-name>bash</function-name>
+<function-params>{ "command": "npx kill-port 3000" }</function-params>
+```
+Model outputs the function name and parameters as separate XML tags with hyphenated names instead of a `<tool_call>` block. Observed specifically with `deepseek-expert` on continuation turns. `<function-params>` content is parsed as JSON; falls back to `{"content": raw}` if invalid.
+
 ### Stray tag cleanup
 Orphaned `</tool_call>`, `<tool_call>`, `<tool_calls>` tags left over after extraction are stripped from the returned `cleaned_text`.
 
