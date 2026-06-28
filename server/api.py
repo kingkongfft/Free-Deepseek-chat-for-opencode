@@ -133,11 +133,37 @@ async def chat_completions(req: ChatCompletionRequest):
     # turns appear in the same DeepSeek UI chat. The client's own conversation_id
     # (from a previous response) takes precedence — it already encodes the right
     # session + parent message for multi-turn threading.
+    #
+    # IMPORTANT: opencode does NOT echo conversation_id back on continuation turns
+    # (it's not an OpenAI standard field). So every turn is a fresh DeepSeek call
+    # with the full message history reconstructed into `prompt`. We therefore never
+    # resume a DeepSeek thread mid-conversation — each request is self-contained.
+    # DEEPSEEK_SESSION_ID only pins which chat *session* new messages land in.
+    is_continuation = any(m.role == "tool" for m in req.messages) or (
+        sum(1 for m in req.messages if m.role == "assistant") > 0
+        and req.messages[-1].role != "user"
+    )
     effective_cid = req.conversation_id or (
-        DEEPSEEK_SESSION_ID if DEEPSEEK_SESSION_ID else None
+        DEEPSEEK_SESSION_ID if (DEEPSEEK_SESSION_ID and not is_continuation) else None
     )
     model_type = None if effective_cid else resolve_model_type(req.model)
     prompt, has_tools = messages_to_prompt(req.messages, tools=req.tools)
+
+    # Dump continuation prompt to file for debugging tool result handling
+    if req.tools and any(m.role == "tool" for m in req.messages):
+        try:
+            import json as _json
+
+            with open("debug_continuation.txt", "w", encoding="utf-8") as _f:
+                _f.write("=== MESSAGES ===\n")
+                for _m in req.messages:
+                    _f.write(
+                        _json.dumps(_m.model_dump(exclude_none=True), indent=2) + "\n"
+                    )
+                _f.write("\n=== PROMPT SENT TO DEEPSEEK ===\n")
+                _f.write(prompt)
+        except Exception:
+            pass
 
     try:
         # Off the event loop: get_client() uses Playwright's sync API, which

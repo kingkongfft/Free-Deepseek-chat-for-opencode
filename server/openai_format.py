@@ -115,6 +115,7 @@ OUTPUT FORMAT — when using a tool your ENTIRE response must be ONLY this:
 {example}
 
 MANDATORY RULES:
+- Do NOT wrap tool calls in ```json ... ``` markdown code blocks.
 - Do NOT write any text before or after the <tool_call> block.
 - Do NOT say "I'll ...", "Let me ...", or narrate your action.
 - Do NOT add attributes to the tag: WRONG: <tool_call name="read"> — CORRECT: <tool_call>
@@ -185,8 +186,10 @@ def _parse_tool_calls(
     3. Anthropic XML: <tool_calls><invoke name="fn"><parameter name="k">v</parameter></invoke></tool_calls>
     4. Direct tag:    <fn_name>{"arg": "val"}</fn_name>
     5. Code-fenced JSON inside any of the above
-    6. Narration text before/after any block (stripped from content)
-    7. Stray/orphaned closing tags are stripped
+    6. Fenced shell block: ```bash\n<cmd>\n```
+    7. Split hyphenated tags: <function-name>fn</function-name><function-params>{...}</function-params>
+    8. Narration text before/after any block (stripped from content)
+    9. Stray/orphaned closing tags are stripped
     """
     tool_calls: List[Dict[str, Any]] = []
     cleaned = text
@@ -281,7 +284,85 @@ def _parse_tool_calls(
             if tag_matches:
                 cleaned = re.sub(tag_pattern, "", cleaned, flags=re.DOTALL).strip()
 
+    # --- Format 5: bare fenced JSON ```json\n{"name":..,"arguments":..}\n``` ---
+    # Model outputs a markdown code block containing a tool call JSON object.
+    # This happens when the model ignores XML tag instructions entirely.
+    if not tool_calls:
+        fence_pattern = r"```(?:json)?\s*(\{.*?\})\s*```"
+        fence_matches = re.findall(fence_pattern, text, re.DOTALL)
+        for raw in fence_matches:
+            obj = _parse_json_block(raw)
+            if obj and "name" in obj and "arguments" in obj:
+                tool_calls.append(_make_tool_call(obj["name"], obj["arguments"]))
+        if tool_calls:
+            cleaned = re.sub(fence_pattern, "", cleaned, flags=re.DOTALL).strip()
+
+    # --- Format 7: <function-name>fn</function-name><function-params>{...}</function-params> ---
+    # Model outputs split XML tags with hyphenated names.
+    # e.g. <function-name>bash</function-name>\n<function-params>{"command": "ls"}</function-params>
+    if not tool_calls:
+        fn_name_pattern = r"<function-name>\s*(.*?)\s*</function-name>"
+        fn_params_pattern = r"<function-params>\s*(.*?)\s*</function-params>"
+        fn_name_m = re.search(fn_name_pattern, text, re.DOTALL)
+        fn_params_m = re.search(fn_params_pattern, text, re.DOTALL)
+        if fn_name_m:
+            fn_name = fn_name_m.group(1).strip()
+            raw_params = fn_params_m.group(1).strip() if fn_params_m else "{}"
+            obj = _parse_json_block(raw_params)
+            args = obj if obj is not None else {"content": raw_params}
+            tool_calls.append(_make_tool_call(fn_name, args))
+            cleaned = re.sub(fn_name_pattern, "", cleaned, flags=re.DOTALL)
+            cleaned = re.sub(fn_params_pattern, "", cleaned, flags=re.DOTALL).strip()
+
+    # --- Format 6: fenced shell blocks as bash tool call (last resort) ---
+    # Model outputs ```bash\n<cmd>\n``` instead of <tool_call>. Only attempts
+    # when tools were explicitly requested and no other format matched.
+    if not tool_calls and tools:
+        # Match the FIRST fenced code block (bash/sh/cmd/powershell or no lang)
+        # Skip blocks whose content is clearly not a shell command (JSON-like, etc.)
+        fence_pattern = r"```(?:bash|shell|sh|cmd|powershell|pwsh)?\s*\n?(.*?)\n?```"
+        fence_matches = re.findall(fence_pattern, text, re.DOTALL)
+        for raw in fence_matches:
+            cmd = raw.strip()
+            # Skip JSON-like blocks (handled by Format 5 above) and multi-line
+            # code snippets that look like file content, not a command.
+            if not cmd:
+                continue
+            if cmd.startswith("{") or cmd.startswith("["):
+                continue
+            tool_calls.append(_make_tool_call("bash", {"command": cmd}))
+            break  # only take the first fenced command block
+        if tool_calls:
+            cleaned = re.sub(fence_pattern, "", cleaned, flags=re.DOTALL).strip()
+
     return cleaned, tool_calls
+
+
+def _summarise_completed_tool_calls(messages: List[ChatMessage]) -> str:
+    """Build a compact summary of tool calls already executed in this conversation,
+    so the model knows not to repeat them."""
+    done = []
+    for m in messages:
+        if m.role == "assistant" and m.tool_calls:
+            for tc in m.tool_calls:
+                fn = tc.get("function", {})
+                name = fn.get("name", "?")
+                try:
+                    args = json.loads(fn.get("arguments", "{}"))
+                except Exception:
+                    args = {}
+                # Show a one-line summary per call
+                key_arg = (
+                    args.get("filePath")
+                    or args.get("command")
+                    or args.get("url")
+                    or args.get("pattern")
+                    or args.get("query")
+                    or ""
+                )
+                hint = f"({key_arg})" if key_arg else ""
+                done.append(f"  - called `{name}` {hint} ✓")
+    return "\n".join(done)
 
 
 def messages_to_prompt(
@@ -291,9 +372,15 @@ def messages_to_prompt(
     """Flatten a chat history into a single prompt DeepSeek can answer.
 
     Returns (prompt, has_tools) where has_tools indicates if tools were injected.
+
+    On continuation turns (last message is a tool result):
+    - Builds a clear summary of what was already done
+    - Shows each tool result explicitly
+    - Tells the model to continue WITHOUT repeating completed steps
     """
     has_tools = False
 
+    # Fast path: single user message
     if len(messages) == 1 and messages[0].role == "user":
         text = _text_of(messages[0].content)
         if tools:
@@ -302,25 +389,95 @@ def messages_to_prompt(
             has_tools = True
         return text, has_tools
 
+    # Detect continuation: ends with one or more tool result messages
+    last_role = next(
+        (m.role for m in reversed(messages) if m.role != "system"),
+        "user",
+    )
+    ends_with_tool_result = last_role == "tool"
+
     lines = []
 
-    # Inject tool definitions with the first system message or at the start
+    # On continuation turns, emit original system messages BEFORE our
+    # continuation prompt. Otherwise the massive opencode system prompt
+    # (500+ lines) comes after our "output ONLY a <tool_call>" instruction
+    # and contradicts it, causing the model to narrate instead of tool-calling.
+    if ends_with_tool_result and tools:
+        for m in messages:
+            if m.role == "system":
+                sys_text = _text_of(m.content)
+                if sys_text:
+                    lines.append(f"System: {sys_text}")
+
     if tools:
-        tool_section = _format_tool_definitions(tools)
-        lines.append(f"System: {tool_section}")
         has_tools = True
+        if ends_with_tool_result:
+            # Show only the last 10 completed steps to keep prompt compact
+            completed = _summarise_completed_tool_calls(messages)
+            completed_lines = completed.split("\n")
+            if len(completed_lines) > 10:
+                completed_lines = completed_lines[-10:]
+                completed_lines.insert(
+                    0,
+                    f"  ... ({len(completed.split(chr(10))) - 10} earlier steps omitted)",
+                )
+            completed = "\n".join(completed_lines)
+            completed_block = f"\nAlready completed:\n{completed}" if completed else ""
+            # Compact long tool lists (opencode sends 60+ tools)
+            if len(tools) > 10:
+                common = [
+                    t.function.name
+                    for t in tools
+                    if t.function.name
+                    in {
+                        "bash",
+                        "read",
+                        "write",
+                        "edit",
+                        "glob",
+                        "grep",
+                        "webfetch",
+                        "todowrite",
+                        "task",
+                        "skill",
+                    }
+                ]
+                remaining = len(tools) - len(common)
+                tool_names = ", ".join(f"`{n}`" for n in common)
+                if remaining > 0:
+                    tool_names += f" (and {remaining} more)"
+            else:
+                tool_names = ", ".join(f"`{t.function.name}`" for t in tools)
+            lines.append(
+                f"System: You are a helpful assistant with access to tools: {tool_names}.\n"
+                f"{completed_block}\n"
+                f"The tool results below have just been returned. "
+                f"DO NOT repeat any tool call that is already marked completed above. "
+                f"Review the results and either:\n"
+                f"  a) Call the NEXT required tool (output ONLY a <tool_call> block, no other text), or\n"
+                f"  b) If all steps are done, respond with a plain-text summary.\n"
+                f"Tool call format reminder:\n"
+                f"<tool_call>\n"
+                f'{{"name": "TOOL_NAME", "arguments": {{"PARAM": "VALUE"}}}}\n'
+                f"</tool_call>"
+            )
+        else:
+            tool_section = _format_tool_definitions(tools)
+            lines.append(f"System: {tool_section}")
 
     for m in messages:
-        if m.role == "tool":
-            # Tool result messages - format as tool response
-            label = "ToolResult"
-            content = _text_of(m.content) if m.content else ""
-            if m.tool_call_id:
-                lines.append(f"{label} [{m.tool_call_id}]: {content}")
-            else:
-                lines.append(f"{label}: {content}")
+        if m.role == "system":
+            if ends_with_tool_result and tools:
+                continue  # already emitted above (before continuation prompt)
+            sys_text = _text_of(m.content)
+            if sys_text:
+                lines.append(f"System: {sys_text}")
+        elif m.role == "tool":
+            content = _text_of(m.content) if m.content else "(no output)"
+            tool_name = m.name or ""
+            name_hint = f" ({tool_name})" if tool_name else ""
+            lines.append(f"ToolResult{name_hint}: {content}")
         elif m.role == "assistant" and m.tool_calls:
-            # Assistant message with tool calls - format the calls
             for tc in m.tool_calls:
                 fn = tc.get("function", {})
                 name = fn.get("name", "unknown")
@@ -330,12 +487,13 @@ def messages_to_prompt(
                     f'{{"name": "{name}", "arguments": {args}}}\n'
                     f"</tool_call>"
                 )
-            # Also include any text content
             if m.content:
-                lines.append(f"Assistant: {m.content}")
+                lines.append(f"Assistant: {_text_of(m.content)}")
         else:
             label = _ROLE_LABELS.get(m.role, m.role.capitalize())
-            lines.append(f"{label}: {_text_of(m.content)}")
+            text = _text_of(m.content)
+            if text:
+                lines.append(f"{label}: {text}")
 
     lines.append("Assistant:")
     return "\n\n".join(lines), has_tools
