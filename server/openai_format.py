@@ -559,14 +559,37 @@ def messages_to_prompt(
                     tool_names += f" (and {remaining} more)"
             else:
                 tool_names = ", ".join(f"`{t.function.name}`" for t in effective_tools)
+            # Determine what the last tool call was — if it was a read/query
+            # tool, the model should present the result as plain text, not call
+            # another tool. Prompting it to call "the next tool" in that case
+            # causes it to invent a bash call to "display" the file content.
+            last_tool_call_name = None
+            for m in reversed(messages):
+                if m.role == "assistant" and m.tool_calls:
+                    fn = m.tool_calls[-1].get("function", {})
+                    last_tool_call_name = fn.get("name")
+                    break
+            read_query_tools = {"read", "grep", "glob", "webfetch"}
+            last_was_read = last_tool_call_name in read_query_tools
+
+            if last_was_read:
+                next_step_instruction = (
+                    f"The tool result above contains the requested content. "
+                    f"Output it directly as plain text — do NOT call any more tools."
+                )
+            else:
+                next_step_instruction = (
+                    f"Review the results and either:\n"
+                    f"  a) Call the NEXT required tool (output ONLY a <tool_call> block, no other text), or\n"
+                    f"  b) If all steps are done, respond with a plain-text summary."
+                )
+
             lines.append(
                 f"System: You are a helpful assistant with access to tools: {tool_names}.\n"
                 f"{completed_block}\n"
                 f"The tool results below have just been returned. "
                 f"DO NOT repeat any tool call that is already marked completed above. "
-                f"Review the results and either:\n"
-                f"  a) Call the NEXT required tool (output ONLY a <tool_call> block, no other text), or\n"
-                f"  b) If all steps are done, respond with a plain-text summary.\n"
+                f"{next_step_instruction}\n"
                 f"Tool call format reminder:\n"
                 f"<tool_call>\n"
                 f'{{"name": "TOOL_NAME", "arguments": {{"PARAM": "VALUE"}}}}\n'
