@@ -79,12 +79,28 @@ def _text_of(content) -> str:
 
 
 def _has_file_parts(content) -> bool:
-    """Return True if content contains any inlined file/document parts."""
+    """Return True if content contains pre-fetched file content from an opencode @mention.
+
+    opencode executes the read tool client-side and injects the result as three plain
+    text parts — NOT as a type=file part. The signature is the middle part which starts
+    with "Called the Read tool with the following input:".
+    We also check for type=file/document for forward-compatibility with other clients.
+    """
     if not isinstance(content, list):
         return False
-    return any(
-        isinstance(p, dict) and p.get("type") in ("file", "document") for p in content
-    )
+    for p in content:
+        if not isinstance(p, dict):
+            continue
+        t = p.get("type")
+        # Forward-compat: actual file content part
+        if t in ("file", "document"):
+            return True
+        # opencode @mention pattern: annotation injected by opencode before the file content
+        if t == "text" and "Called the Read tool with the following input:" in (
+            p.get("text") or ""
+        ):
+            return True
+    return False
 
 
 def _example_for_tool(tools: List[Tool]) -> str:
@@ -419,10 +435,14 @@ def _summarise_completed_tool_calls(messages: List[ChatMessage]) -> str:
 def messages_to_prompt(
     messages: List[ChatMessage],
     tools: Optional[List[Tool]] = None,
-) -> Tuple[str, bool]:
+) -> Tuple[str, bool, bool]:
     """Flatten a chat history into a single prompt DeepSeek can answer.
 
-    Returns (prompt, has_tools) where has_tools indicates if tools were injected.
+    Returns (prompt, has_tools, files_inlined) where:
+      - has_tools: tool definitions were injected into the prompt
+      - files_inlined: the last user message already contains pre-fetched file
+        content (opencode @mention). When True, tool injection is suppressed and
+        callers should also skip _parse_tool_calls on the response.
 
     On continuation turns (last message is a tool result):
     - Builds a clear summary of what was already done
@@ -444,7 +464,7 @@ def messages_to_prompt(
             tool_section = _format_tool_definitions(effective_tools)
             text = f"{tool_section}\n\nUser: {text}"
             has_tools = True
-        return text, has_tools
+        return text, has_tools, files_inlined
 
     # Detect continuation: ends with one or more tool result messages
     last_role = next(
@@ -553,7 +573,7 @@ def messages_to_prompt(
                 lines.append(f"{label}: {text}")
 
     lines.append("Assistant:")
-    return "\n\n".join(lines), has_tools
+    return "\n\n".join(lines), has_tools, files_inlined
 
 
 def _now() -> int:

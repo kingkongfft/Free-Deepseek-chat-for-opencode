@@ -210,6 +210,22 @@ Review the results and either:
 **Symptom:** Model repeats an already-completed tool call (e.g. writes `index.js` again after it was already written).  
 **Fix:** `_summarise_completed_tool_calls()` builds an explicit checklist injected into the continuation system prompt with `DO NOT repeat` instruction.
 
+### 6. `@file` mention model ignores inline content (resolved)
+**Symptom:** When opencode sends an `@file` mention, the file content is already pre-fetched by opencode and inlined in the user message as plain `text` parts (opencode executes the `read` tool client-side and injects the result). With tool definitions also present, the model would call the `read` tool again instead of answering from the already-present content, or would give a stale/summary answer.  
+**Root cause:** Tool injection into the prompt caused the model to try to re-fetch the file rather than answer from the inline content.  
+**Fix:** `_has_file_parts()` detects `type=file` or `type=document` content parts in the last user message. When present, `effective_tools = None` — tool definitions are stripped from the prompt and the model answers directly from the inline content.  
+**Note:** opencode's `@` mention format (confirmed from live traffic capture) sends **three `text` parts** — the user's typed text, a "Called the Read tool with..." annotation, and the raw `<path>/<content>` XML output — all as `type: "text"`, not `type: "file"`. The `_has_file_parts()` check therefore also matches on the annotation text pattern.
+
+**Actual wire format from opencode `@file` mention:**
+```json
+{"role": "user", "content": [
+  {"type": "text", "text": "@README.md , read it"},
+  {"type": "text", "text": "Called the Read tool with the following input: {\"filePath\":\"C:\\\\...\\\\README.md\"}"},
+  {"type": "text", "text": "<path>C:\\...\\README.md</path>\n<type>file</type>\n<content>\n1: ...\n</content>"}
+]}
+```
+The `<path>` / `<content>` XML is injected as a plain text part — there is no `type: "file"` part. The fix detects the `Called the Read tool` annotation string to identify pre-fetched file content.
+
 ---
 
 ## Auto-start on Windows boot (Task Scheduler)

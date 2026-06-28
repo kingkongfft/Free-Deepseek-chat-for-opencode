@@ -147,9 +147,33 @@ async def chat_completions(req: ChatCompletionRequest):
         DEEPSEEK_SESSION_ID if (DEEPSEEK_SESSION_ID and not is_continuation) else None
     )
     model_type = None if effective_cid else resolve_model_type(req.model)
-    prompt, has_tools = messages_to_prompt(req.messages, tools=req.tools)
+    prompt, has_tools, files_inlined = messages_to_prompt(req.messages, tools=req.tools)
 
     # Dump continuation prompt to file for debugging tool result handling
+    # Always dump every request for debugging
+    try:
+        import json as _json, os as _os
+
+        _base = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        with open(
+            _os.path.join(_base, "debug_request.json"), "w", encoding="utf-8"
+        ) as _f:
+            _f.write(
+                _json.dumps(
+                    {
+                        "messages": [
+                            _m.model_dump(exclude_none=True) for _m in req.messages
+                        ],
+                        "has_tools": bool(req.tools),
+                        "prompt": prompt,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+    except Exception:
+        pass
+
     if req.tools and any(m.role == "tool" for m in req.messages):
         try:
             import json as _json
@@ -184,7 +208,9 @@ async def chat_completions(req: ChatCompletionRequest):
                 thinking=req.thinking,
                 search=req.search,
             )
-            yield from stream_chunks(req.model, stream, tools=req.tools)
+            yield from stream_chunks(
+                req.model, stream, tools=None if files_inlined else req.tools
+            )
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -200,10 +226,12 @@ async def chat_completions(req: ChatCompletionRequest):
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 
-    # Parse tool calls from the response if tools were provided
+    # Parse tool calls from the response if tools were provided.
+    # Skip when files were inlined (@mention) — the model answers directly,
+    # any tool-call-shaped text in the response is a hallucination, not a real call.
     tool_calls = None
     content = reply.text
-    if req.tools:
+    if req.tools and not files_inlined:
         content, tool_calls = _parse_tool_calls(reply.text, tools=req.tools)
         if not tool_calls:
             _log.warning(
