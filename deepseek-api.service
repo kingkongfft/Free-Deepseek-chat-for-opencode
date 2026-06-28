@@ -1,0 +1,48 @@
+# deepseek-api.service — systemd user service for Free-Deepseek-chat-for-opencode
+#
+# Install:
+#   systemctl --user link "$(pwd)/deepseek-api.service"
+#   systemctl --user enable  deepseek-api.service
+#   systemctl --user start   deepseek-api.service
+#
+# Uninstall:
+#   systemctl --user stop    deepseek-api.service
+#   systemctl --user disable deepseek-api.service
+#
+# View logs:
+#   journalctl --user -u deepseek-api.service -f
+#
+
+[Unit]
+Description=DeepSeek API — OpenAI-compatible server for free DeepSeek chat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/repos/Free-Deepseek-chat-for-opencode
+
+# Python virtual environment
+ExecStart=%h/repos/Free-Deepseek-chat-for-opencode/venv/bin/python app.py
+
+# Load .env
+EnvironmentFile=-%h/repos/Free-Deepseek-chat-for-opencode/.env
+
+# Restart on crash (but not on quick flurry)
+Restart=on-failure
+RestartSec=5
+
+# Kill gracefully, then force after 30s
+TimeoutStopSec=30
+KillMode=process
+
+# Standard output goes to journal (journalctl --user -u deepseek-api.service -f)
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

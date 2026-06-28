@@ -1,24 +1,25 @@
 ## Improving status
 
 - Date: 2026-06-28
-- Scope: harden tool-call continuation handling for opencode-style clients using the DeepSeek-compatible server.
+- Scope: Linux auto-run infrastructure (systemd user service + startup bash script + install helper).
 
 ### What was improved
 
-- Expanded loop detection in `server/openai_format.py` so repeated trailing tool calls can disable tool injection and force a plain-text answer.
-- Added suppression for bogus `bash` tool calls that are clearly trying to display text instead of execute a real shell command.
-- Wired suppression into both non-stream and stream paths in `server/api.py`.
-- Preserved the existing continuation prompt improvements and layered the new safeguards on top.
+- Created `startup.sh` — Linux bash equivalent of the existing `startup.ps1`. Sources `.env`, activates venv, starts `app.py` in background, logs to `logs/`.
+- Created `deepseek-api.service` — systemd user unit for auto-start at login with auto-restart on crash.
+- Created `install-service.sh` — one-shot script to link, enable, and start the systemd service; supports `--uninstall`.
+- Made service tolerant of missing `.env` by using systemd's optional `-` prefix on `EnvironmentFile`.
 
 ### Why this was needed
 
-- The model was reading a file correctly, then trying to "print" the file by calling `bash` with markdown or prose as the shell command.
-- The model changed the bogus command shape across retries, so a simple exact-repeat guard was not enough.
+- The project already had Windows auto-start via Task Scheduler (`startup.ps1` / `register-startup.ps1`) but no equivalent for Linux.
+- Running the app manually or via tmux/screen is fragile; a systemd user service survives crashes and starts at login.
 
-### Current code areas touched
+### Current code areas touched (new files)
 
-- `server/openai_format.py`
-- `server/api.py`
+- `startup.sh`
+- `deepseek-api.service`
+- `install-service.sh`
 
 ### Remaining improvement opportunities
 
