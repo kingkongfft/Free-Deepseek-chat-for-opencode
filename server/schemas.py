@@ -27,8 +27,8 @@ class ToolChoice(BaseModel):
 
 class ChatMessage(BaseModel):
     role: str
-    # content is a plain string, or a list of parts (OpenAI vision-style). We only
-    # read text parts; non-text parts are ignored.
+    # content is a plain string, or a list of content parts (OpenAI multipart /
+    # opencode @file mentions). Handled types: text, file, document, image_url.
     content: Union[str, List[dict], None] = None
     # Tool call fields
     tool_calls: Optional[List[Dict[str, Any]]] = None

@@ -24,15 +24,57 @@ _log = logging.getLogger(__name__)
 
 
 def _text_of(content) -> str:
-    """Extract plain text from a message's content (string or list-of-parts)."""
+    """Extract plain text from a message's content (string or list-of-parts).
+
+    Handles OpenAI content-part arrays, including:
+      - {"type": "text", "text": "..."}           — plain text
+      - {"type": "file", "file": {...}}            — opencode @file mention (OpenAI files API shape)
+      - {"type": "document", ...}                 — Anthropic-style document block
+      - {"type": "image_url", ...}                — images (described, not passed as pixels)
+    Unknown types are logged at DEBUG level so they can be diagnosed.
+    """
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     parts = []
     for p in content:
-        if isinstance(p, dict) and p.get("type") == "text":
+        if not isinstance(p, dict):
+            continue
+        t = p.get("type")
+        if t == "text":
             parts.append(p.get("text", ""))
+        elif t == "file":
+            # OpenAI files API shape used by opencode @file mentions:
+            # {"type": "file", "file": {"filename": "...", "content": "..."}}
+            file_obj = p.get("file") or {}
+            filename = file_obj.get("filename") or file_obj.get("name") or "file"
+            file_text = (
+                file_obj.get("content")  # text/base64 content
+                or file_obj.get("text")
+                or p.get("content")  # fallback: content at top level
+                or p.get("text")
+                or ""
+            )
+            if file_text:
+                parts.append(f"[File: {filename}]\n{file_text}")
+            else:
+                _log.debug("_text_of: file part has no readable content: %s", p)
+        elif t == "document":
+            # Anthropic-style: {"type": "document", "source": {"type": "text", "data": "..."}}
+            source = p.get("source") or {}
+            doc_text = source.get("data") or source.get("text") or p.get("text") or ""
+            title = p.get("title") or source.get("filename") or "document"
+            if doc_text:
+                parts.append(f"[Document: {title}]\n{doc_text}")
+        elif t == "image_url":
+            url = (p.get("image_url") or {}).get("url", "")
+            if url.startswith("data:"):
+                parts.append("[Image: embedded base64 image — not shown]")
+            else:
+                parts.append(f"[Image: {url}]")
+        else:
+            _log.debug("_text_of: unhandled content part type %r: %s", t, p)
     return "\n".join(parts)
 
 
