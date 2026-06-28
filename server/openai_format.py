@@ -457,6 +457,40 @@ def messages_to_prompt(
     files_inlined = last_user is not None and _has_file_parts(last_user.content)
     effective_tools = None if files_inlined else tools
 
+    # Detect tool-call loops: if the last 2+ assistant messages all made the
+    # exact same tool call (same name + same arguments), the model is stuck.
+    # Strip all repeated loop iterations from history, keeping only the first
+    # call + result, and inject a warning so the model breaks out.
+    loop_warning = ""
+    if tools and not files_inlined:
+        # Collect (name, args) for recent consecutive assistant tool calls
+        recent_calls = []
+        for m in reversed(messages):
+            if m.role in ("tool", "assistant"):
+                if m.role == "assistant" and m.tool_calls:
+                    for tc in m.tool_calls:
+                        fn = tc.get("function", {})
+                        recent_calls.append((fn.get("name"), fn.get("arguments")))
+            else:
+                break
+        if len(recent_calls) >= 3:
+            # Check if all calls are identical
+            unique = set((n, a) for n, a in recent_calls)
+            if len(unique) == 1:
+                loop_name, loop_args = list(unique)[0]
+                loop_warning = (
+                    f"\n\nWARNING: The tool call `{loop_name}` with the same arguments "
+                    f"has been attempted {len(recent_calls)} times and keeps failing. "
+                    f"DO NOT call `{loop_name}` again with these arguments. "
+                    f"Instead, respond in plain text to answer the user's question directly."
+                )
+                _log.warning(
+                    "Tool call loop detected: %s called %d times with same args. "
+                    "Injecting loop-break warning into prompt.",
+                    loop_name,
+                    len(recent_calls),
+                )
+
     # Fast path: single user message
     if len(messages) == 1 and messages[0].role == "user":
         text = _text_of(messages[0].content)
@@ -570,6 +604,9 @@ def messages_to_prompt(
             label = _ROLE_LABELS.get(m.role, m.role.capitalize())
             text = _text_of(m.content)
             if text:
+                # Append loop-break warning to the last user message
+                if loop_warning and m is messages[-1] and m.role == "user":
+                    text = text + loop_warning
                 lines.append(f"{label}: {text}")
 
     lines.append("Assistant:")
